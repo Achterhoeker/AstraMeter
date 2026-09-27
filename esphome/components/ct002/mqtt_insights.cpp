@@ -303,6 +303,7 @@ void MqttInsightsComponent::publish_consumer_event_(const std::string &consumer_
     // reads its state here, so it shows "off" when active control is disabled
     // (via YAML or the switch itself) rather than always reading "on".
     root["active_control"] = this->ct002_->active_control();
+    root["peakshaving_threshold"] = this->ct002_->peakshaving_threshold();
     root["consumer_count"] = this->ct002_->reporting_consumer_count();
     // How well the loop is holding the grid at zero, plus a 0-100 score — the
     // one pair of entities that answers "is this working?" without reading the
@@ -531,6 +532,8 @@ void MqttInsightsComponent::handle_consumer_field_command_(const std::string &co
 }
 
 void MqttInsightsComponent::handle_device_command_(const std::string &payload) {
+  const bool active_control_before = this->ct002_->active_control();
+  const float peakshaving_threshold_before = this->ct002_->peakshaving_threshold();
   bool parsed = json::parse_json(payload, [&](JsonObject root) -> bool {
     if (root["force_rotation"].is<bool>() && root["force_rotation"].as<bool>()) {
       this->ct002_->force_balancer_rotation();
@@ -543,9 +546,40 @@ void MqttInsightsComponent::handle_device_command_(const std::string &payload) {
     } else if (!root["active_control"].isNull()) {
       ESP_LOGW(TAG, "Invalid active_control value in device command");
     }
+    if (root["peakshaving_threshold"].is<float>()) {
+      const float t = root["peakshaving_threshold"].as<float>();
+      if (std::isfinite(t) && t >= 0.0f) {
+        this->ct002_->set_peakshaving_threshold(t);
+      } else {
+        ESP_LOGW(TAG, "Out-of-range peakshaving_threshold in device command");
+      }
+    } else if (!root["peakshaving_threshold"].isNull()) {
+      ESP_LOGW(TAG, "Invalid peakshaving_threshold value in device command");
+    }
     return true;
   });
-  if (!parsed) ESP_LOGW(TAG, "Invalid device command payload");
+  if (!parsed) {
+    ESP_LOGW(TAG, "Invalid device command payload");
+    return;
+  }
+  if (this->ct002_->active_control() != active_control_before ||
+      this->ct002_->peakshaving_threshold() != peakshaving_threshold_before) {
+    this->republish_device_settings_();
+  }
+}
+
+void MqttInsightsComponent::republish_device_settings_() {
+  // active_control and peakshaving_threshold share one retained command
+  // topic, so writing either one would otherwise replace the broker's only
+  // copy of the other. Republish the merged settings after every change so
+  // the retained message always reflects both fields (mirrors
+  // MqttInsightsService._republish_device_settings on the Python side).
+  auto settings_buf = json::build_json([&](JsonObject root) {
+    root["active_control"] = this->ct002_->active_control();
+    root["peakshaving_threshold"] = this->ct002_->peakshaving_threshold();
+  });
+  const std::string topic = this->base_topic_ + "/ct002/" + this->device_id_ + "/set";
+  this->mqtt_->publish(topic, settings_buf, 0, true);
 }
 
 void MqttInsightsComponent::handle_marstek_message_(const std::string &topic,
